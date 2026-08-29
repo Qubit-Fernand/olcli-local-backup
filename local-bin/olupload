@@ -1,0 +1,661 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: olupload [options] [file ...]
+       olupload --auto [options]
+       olupload --fig [options]
+
+Upload one or more files with `olcli upload`.
+Explicit single-file uploads mirror `olcli upload` / `overleaf upload`.
+Multiple explicit files are uploaded one-by-one.
+With no files, defaults to root-level *.tex files and checks each remote file
+before uploading local files that differ.
+
+Options:
+  --auto                From the Overleaf project root, scan root *.tex files
+                        plus images under figures/, figure/, figs/, or fig/.
+                        Selected files are uploaded one-by-one.
+  --fig                 From the Overleaf project root, scan only images under
+                        figures/, figure/, figs/, or fig/. Root *.tex files are
+                        not uploaded.
+  --project <name-or-id>  Overleaf project name or ID. Defaults to the project
+                          resolved by olcli from the current directory.
+  --folder <id>           Target folder ID passed to olcli upload.
+                          Not allowed with --auto, which routes per file.
+  --cookie <session>      Session cookie override passed to olcli upload.
+  --dry-run             Print what would be uploaded without uploading.
+  -h, --help              Show this help.
+
+Examples:
+  olupload
+  olupload main.tex appendix.tex
+  olupload *.tex
+  olupload --auto
+  olupload --auto --dry-run
+  olupload --fig --dry-run
+  olupload --project 0123456789abcdef01234567 *.tex
+  olupload --folder 64abcdef0123456789abcdef figures/a.pdf figures/b.pdf
+EOF
+}
+
+project=""
+folder=""
+cookie=""
+auto=0
+fig=0
+dry_run=0
+files=()
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --auto)
+      auto=1
+      shift
+      ;;
+    --fig)
+      fig=1
+      shift
+      ;;
+    --project)
+      if [[ "$#" -lt 2 ]]; then
+        echo "olupload: --project requires a value" >&2
+        exit 1
+      fi
+      project="$2"
+      shift 2
+      ;;
+    --folder)
+      if [[ "$#" -lt 2 ]]; then
+        echo "olupload: --folder requires a value" >&2
+        exit 1
+      fi
+      folder="$2"
+      shift 2
+      ;;
+    --cookie)
+      if [[ "$#" -lt 2 ]]; then
+        echo "olupload: --cookie requires a value" >&2
+        exit 1
+      fi
+      cookie="$2"
+      shift 2
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    --)
+      shift
+      while [[ "$#" -gt 0 ]]; do
+        files+=("$1")
+        shift
+      done
+      ;;
+    -*)
+      echo "olupload: unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      files+=("$1")
+      shift
+      ;;
+  esac
+done
+
+find_project_root() {
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -f "$dir/.olcli.json" ]]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
+sha256_file() {
+  shasum -a 256 "$1" | awk '{print $1}'
+}
+
+collect_auto_files() {
+  local root="$1"
+  (
+    cd "$root"
+    find . -maxdepth 1 -type f -name '*.tex' -print0
+  )
+  collect_figure_files "$root"
+}
+
+collect_figure_files() {
+  local root="$1"
+  (
+    cd "$root"
+    for dir in figures figure figs fig; do
+      if [[ -d "$dir" ]]; then
+        find "$dir" -type f \( \
+          -iname '*.pdf' -o -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o \
+          -iname '*.eps' -o -iname '*.svg' -o -iname '*.tif' -o -iname '*.tiff' \
+        \) -print0
+      fi
+    done
+  )
+}
+
+collect_root_tex_files() {
+  local root="$1"
+  (
+    cd "$root"
+    find . -maxdepth 1 -type f -name '*.tex' -print0
+  )
+}
+
+normalise_project_relative_path() {
+  local root="$1"
+  local path="$2"
+  case "$path" in
+    "$root"/*)
+      printf '%s\n' "${path#"$root"/}"
+      ;;
+    /*)
+      echo "olupload: file is outside project root: $path" >&2
+      return 1
+      ;;
+    ./*)
+      printf '%s\n' "${path#./}"
+      ;;
+    *)
+      printf '%s\n' "$path"
+      ;;
+  esac
+}
+
+base_hash_for_file() {
+  local root="$1"
+  local rel="$2"
+  local base_file="$root/tmp/olcli-remote-check/base-hashes.sha256"
+  local cached=""
+
+  cached="$(awk -v path="$rel" '$2 == path { print $1; found = 1 } END { exit found ? 0 : 1 }' "$base_file" 2>/dev/null || true)"
+  if [[ -n "$cached" ]]; then
+    printf '%s\n' "$cached"
+    return 0
+  fi
+
+  python3 - "$root/.olcli.json" "$rel" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+meta_path, rel = sys.argv[1:]
+try:
+    meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+old = (meta.get("fileHashes") or {}).get(rel)
+if old:
+    print(old)
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+record_base_hash() {
+  local root="$1"
+  local rel="$2"
+  local hash="$3"
+  local base_dir="$root/tmp/olcli-remote-check"
+  local base_file="$base_dir/base-hashes.sha256"
+  local new_file="$base_dir/base-hashes.new"
+
+  mkdir -p "$base_dir"
+  awk -v path="$rel" '$2 != path' "$base_file" 2>/dev/null > "$new_file" || true
+  printf '%s  %s\n' "$hash" "$rel" >> "$new_file"
+  mv "$new_file" "$base_file"
+}
+
+safe_trash() {
+  local path="$1"
+  [[ -e "$path" ]] || return 0
+
+  if command -v trash >/dev/null 2>&1; then
+    trash "$path" >/dev/null 2>&1 || return 0
+    return 0
+  fi
+
+  local trash_dir="$HOME/.Trash"
+  mkdir -p "$trash_dir"
+  mv "$path" "$trash_dir/$(basename "$path").$(date +%Y%m%d-%H%M%S).trashed" 2>/dev/null || true
+}
+
+olcli_node_bin() {
+  local node version major minor patch score best_node="" best_score=0
+  for node in "$HOME"/.nvm/versions/node/v*/bin/node /opt/homebrew/bin/node /usr/local/bin/node; do
+    [[ -x "$node" ]] || continue
+    version="$("$node" -p 'process.versions.node' 2>/dev/null || true)"
+    IFS=. read -r major minor patch <<< "$version"
+    [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ && "$patch" =~ ^[0-9]+$ ]] || continue
+    if (( major >= 20 )); then
+      score=$((major * 1000000 + minor * 1000 + patch))
+      if (( score > best_score )); then
+        best_score="$score"
+        best_node="$node"
+      fi
+    fi
+  done
+  if [[ -n "$best_node" ]]; then
+    printf '%s\n' "$best_node"
+    return 0
+  fi
+  return 1
+}
+
+olcli_dist_dir() {
+  local node_bin="$1"
+  local prefix dir
+  prefix="$(cd "$(dirname "$node_bin")/.." && pwd -P)"
+  for dir in \
+    "$prefix/lib/node_modules/@aloth/olcli/dist" \
+    "/opt/homebrew/lib/node_modules/@aloth/olcli/dist" \
+    "$HOME"/.nvm/versions/node/v*/lib/node_modules/@aloth/olcli/dist; do
+    if [[ -f "$dir/client.js" && -f "$dir/config.js" ]]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+  done
+  return 1
+}
+
+write_folder_tree_json() {
+  local root="$1"
+  local project_name="$2"
+  local cookie_value="$3"
+  local output_json="$4"
+  local node_bin dist_dir
+  node_bin="$(olcli_node_bin)" || {
+    echo "olupload: could not find Node.js >= 20" >&2
+    return 1
+  }
+  dist_dir="$(olcli_dist_dir "$node_bin")" || {
+    echo "olupload: could not locate olcli dist directory" >&2
+    return 1
+  }
+
+  OLUPLOAD_ROOT="$root" \
+  OLUPLOAD_PROJECT="$project_name" \
+  OLUPLOAD_COOKIE="$cookie_value" \
+  OLUPLOAD_DIST="$dist_dir" \
+  "$node_bin" --input-type=module > "$output_json" <<'NODE'
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const dist = process.env.OLUPLOAD_DIST;
+const root = process.env.OLUPLOAD_ROOT;
+const projectArg = process.env.OLUPLOAD_PROJECT || '';
+const cookieArg = process.env.OLUPLOAD_COOKIE || '';
+
+process.chdir(root);
+
+const { OverleafClient } = await import(`file://${dist}/client.js`);
+const { getSessionCookie, getBaseUrl, getSessionCookieName } = await import(`file://${dist}/config.js`);
+
+const cookie = cookieArg || getSessionCookie();
+if (!cookie) {
+  throw new Error('No session cookie found for olcli');
+}
+
+const client = await OverleafClient.fromSessionCookie(cookie, getBaseUrl(), getSessionCookieName());
+
+let projectId = '';
+if (projectArg) {
+  if (/^[a-f0-9]{24}$/i.test(projectArg)) {
+    projectId = projectArg;
+  } else {
+    const project = await client.getProject(projectArg);
+    if (!project) {
+      throw new Error(`Project not found: ${projectArg}`);
+    }
+    projectId = project.id;
+  }
+} else {
+  const meta = JSON.parse(readFileSync(join(root, '.olcli.json'), 'utf8'));
+  projectId = meta.projectId;
+}
+
+if (!projectId) {
+  throw new Error('No project id found. Use --project or run inside a synced olcli directory.');
+}
+
+let folderTree = await client.getFolderTreeFromSocket(projectId);
+if (!folderTree) {
+  folderTree = { '': await client.getRootFolderId(projectId) };
+}
+
+console.log(JSON.stringify({ projectId, folderTree }, null, 2));
+NODE
+}
+
+folder_id_for_path() {
+  local tree_json="$1"
+  local folder_path="$2"
+  python3 - "$tree_json" "$folder_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+info = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+target = sys.argv[2].strip("/")
+if not target:
+    raise SystemExit(0)
+folder_tree = info.get("folderTree") or {}
+folder_id = folder_tree.get(target)
+if folder_id:
+    print(folder_id)
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+download_remote_snapshot() {
+  local root="$1"
+  local rel="$2"
+  local output="$3"
+  local args=(download)
+  local attempt max_attempts=3
+
+  if [[ -n "$cookie" ]]; then
+    args+=(--cookie "$cookie")
+  fi
+  args+=(-o "$output" "$rel")
+  if [[ -n "$project" ]]; then
+    args+=("$project")
+  fi
+
+  for attempt in $(seq 1 "$max_attempts"); do
+    if (cd "$root" && olcli "${args[@]}"); then
+      return 0
+    fi
+    if (( attempt < max_attempts )); then
+      echo "olupload: remote snapshot download failed for $rel; retrying ($((attempt + 1))/$max_attempts)..." >&2
+      sleep 2
+    fi
+  done
+  return 1
+}
+
+prepare_changed_files() {
+  local root="$1"
+  local remote_dir="$2"
+  local file rel local_hash remote_hash base_hash remote_file safe_name
+  changed_files=()
+
+  for file in "${files[@]}"; do
+    rel="$(normalise_project_relative_path "$root" "$file")" || exit 1
+    if [[ ! -f "$root/$rel" ]]; then
+      echo "olupload: file not found: $rel" >&2
+      exit 1
+    fi
+
+    safe_name="$(printf '%s' "$rel" | shasum -a 256 | awk '{print $1}')"
+    remote_file="$remote_dir/$safe_name.remote"
+
+    echo "olupload: checking $rel"
+    if ! download_remote_snapshot "$root" "$rel" "$remote_file"; then
+      echo "olupload: could not download remote snapshot for $rel; refusing to upload blindly" >&2
+      exit 1
+    fi
+
+    local_hash="$(cd "$root" && sha256_file "$rel")"
+    remote_hash="$(sha256_file "$remote_file")"
+    if [[ "$local_hash" == "$remote_hash" ]]; then
+      echo "olupload: skip $rel (already matches remote)"
+      continue
+    fi
+
+    base_hash="$(base_hash_for_file "$root" "$rel" || true)"
+    if [[ -z "$base_hash" ]]; then
+      echo "olupload: no base hash for $rel; remote differs from local, so review before upload" >&2
+      diff -U0 "$remote_file" "$root/$rel" | rg '^@@' || true
+      exit 1
+    fi
+
+    if [[ "$remote_hash" != "$base_hash" ]]; then
+      echo "olupload: remote $rel changed since last known base; review or pull before upload" >&2
+      diff -U0 "$remote_file" "$root/$rel" | rg '^@@' || true
+      exit 1
+    fi
+
+    changed_files+=("$rel")
+  done
+}
+
+upload_changed_files() {
+  local root="$1"
+  local route_subfolders="$2"
+  local tree_json=""
+  local file folder_path folder_id local_hash
+
+  if [[ "${#changed_files[@]}" -eq 0 ]]; then
+    echo "olupload: found no local files that differ from remote"
+    return 0
+  fi
+
+  echo "olupload: selected ${#changed_files[@]} file(s) to upload"
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    for file in "${changed_files[@]}"; do
+      folder_path="$(dirname "$file")"
+      if [[ "$folder_path" == "." ]]; then
+        folder_path="root"
+      fi
+      echo "olupload: dry-run $file -> $folder_path"
+    done
+    return 0
+  fi
+
+  if [[ "$route_subfolders" -eq 1 ]]; then
+    tree_json="$(mktemp "${TMPDIR:-/tmp}/olupload-folders.XXXXXX")"
+    write_folder_tree_json "$root" "$project" "$cookie" "$tree_json"
+  fi
+
+  for file in "${changed_files[@]}"; do
+    folder_path="$(dirname "$file")"
+    args=(upload)
+    if [[ -n "$cookie" ]]; then
+      args+=(--cookie "$cookie")
+    fi
+    if [[ -n "$folder" ]]; then
+      args+=(--folder "$folder")
+    elif [[ "$route_subfolders" -eq 1 && "$folder_path" != "." ]]; then
+      folder_id="$(folder_id_for_path "$tree_json" "$folder_path")" || {
+        echo "olupload: could not resolve remote folder for $folder_path" >&2
+        echo "olupload: create/sync the folder first, or use olcli push for path-aware uploads" >&2
+        [[ -n "$tree_json" ]] && safe_trash "$tree_json"
+        exit 1
+      }
+      if [[ -z "$folder_id" ]]; then
+        echo "olupload: remote folder has no id for $folder_path" >&2
+        [[ -n "$tree_json" ]] && safe_trash "$tree_json"
+        exit 1
+      fi
+      args+=(--folder "$folder_id")
+    fi
+    args+=("$file")
+    if [[ -n "$project" ]]; then
+      args+=("$project")
+    fi
+
+    echo "olupload: uploading $file"
+    (cd "$root" && olcli "${args[@]}")
+    local_hash="$(cd "$root" && sha256_file "$file")"
+    record_base_hash "$root" "$file" "$local_hash"
+  done
+
+  [[ -n "$tree_json" ]] && safe_trash "$tree_json"
+}
+
+direct_upload_files() {
+  local root="$1"
+  local file rel local_hash
+  local args=()
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    for file in "${files[@]}"; do
+      rel="$(normalise_project_relative_path "$root" "$file")" || exit 1
+      if [[ ! -f "$root/$rel" ]]; then
+        echo "olupload: file not found: $rel" >&2
+        exit 1
+      fi
+      printf 'olupload: dry-run olcli upload'
+      if [[ -n "$folder" ]]; then
+        printf ' --folder %q' "$folder"
+      fi
+      if [[ -n "$cookie" ]]; then
+        printf ' --cookie %q' "$cookie"
+      fi
+      printf ' %q' "$rel"
+      if [[ -n "$project" ]]; then
+        printf ' %q' "$project"
+      fi
+      printf '\n'
+    done
+    return 0
+  fi
+
+  for file in "${files[@]}"; do
+    rel="$(normalise_project_relative_path "$root" "$file")" || exit 1
+    if [[ ! -f "$root/$rel" ]]; then
+      echo "olupload: file not found: $rel" >&2
+      exit 1
+    fi
+
+    args=(upload)
+    if [[ -n "$folder" ]]; then
+      args+=(--folder "$folder")
+    fi
+    if [[ -n "$cookie" ]]; then
+      args+=(--cookie "$cookie")
+    fi
+    args+=("$rel")
+    if [[ -n "$project" ]]; then
+      args+=("$project")
+    fi
+
+    echo "olupload: uploading $rel"
+    (cd "$root" && olcli "${args[@]}")
+    local_hash="$(cd "$root" && sha256_file "$rel")"
+    record_base_hash "$root" "$rel" "$local_hash"
+  done
+}
+
+project_arg=()
+if [[ -n "$project" ]]; then
+  project_arg=("$project")
+fi
+
+cookie_arg=()
+if [[ -n "$cookie" ]]; then
+  cookie_arg=(--cookie "$cookie")
+fi
+
+if [[ "$auto" -eq 1 && "$fig" -eq 1 ]]; then
+  echo "olupload: --auto cannot be combined with --fig" >&2
+  exit 1
+fi
+
+if [[ "$fig" -eq 1 ]]; then
+  if [[ -n "$folder" ]]; then
+    echo "olupload: --folder cannot be combined with --fig" >&2
+    exit 1
+  fi
+  if [[ "${#files[@]}" -ne 0 ]]; then
+    echo "olupload: --fig does not accept explicit files" >&2
+    exit 1
+  fi
+
+  root="$(find_project_root)" || {
+    echo "olupload: --fig must run inside an olcli project with .olcli.json" >&2
+    exit 1
+  }
+
+  while IFS= read -r -d '' path; do
+    rel="${path#./}"
+    files+=("$rel")
+  done < <(collect_figure_files "$root")
+
+  if [[ "${#files[@]}" -eq 0 ]]; then
+    echo "olupload: --fig found no images under figures/ figure/ figs/ or fig/"
+    exit 0
+  fi
+
+  echo "olupload: --fig scanning ${#files[@]} file(s) from $root"
+  changed_files=("${files[@]}")
+  upload_changed_files "$root" 1
+  exit 0
+fi
+
+if [[ "$auto" -eq 1 ]]; then
+  if [[ -n "$folder" ]]; then
+    echo "olupload: --folder cannot be combined with --auto" >&2
+    exit 1
+  fi
+  if [[ "${#files[@]}" -ne 0 ]]; then
+    echo "olupload: --auto does not accept explicit files" >&2
+    exit 1
+  fi
+
+  root="$(find_project_root)" || {
+    echo "olupload: --auto must run inside an olcli project with .olcli.json" >&2
+    exit 1
+  }
+
+  while IFS= read -r -d '' path; do
+    rel="${path#./}"
+    files+=("$rel")
+  done < <(collect_auto_files "$root")
+
+  if [[ "${#files[@]}" -eq 0 ]]; then
+    echo "olupload: --auto found no root *.tex or fig/figs/figure/figures images"
+    exit 0
+  fi
+
+  echo "olupload: --auto scanning ${#files[@]} file(s) from $root"
+  changed_files=("${files[@]}")
+  upload_changed_files "$root" 1
+  exit 0
+fi
+
+if [[ "${#files[@]}" -eq 0 ]]; then
+  root="$(find_project_root)" || {
+    echo "olupload: no files provided and no .olcli.json found; run inside an Overleaf project" >&2
+    exit 1
+  }
+  while IFS= read -r -d '' path; do
+    files+=("${path#./}")
+  done < <(collect_root_tex_files "$root")
+  if [[ "${#files[@]}" -eq 0 ]]; then
+    echo "olupload: no root *.tex files found in $root"
+    exit 0
+  fi
+  echo "olupload: no files provided; scanning root *.tex in $root"
+  remote_dir="$(mktemp -d "${TMPDIR:-/tmp}/olupload-remote.XXXXXX")"
+  cleanup() {
+    safe_trash "$remote_dir"
+  }
+  trap cleanup EXIT
+
+  prepare_changed_files "$root" "$remote_dir"
+  upload_changed_files "$root" 0
+  exit 0
+else
+  root="$(find_project_root || pwd)"
+  direct_upload_files "$root"
+  exit 0
+fi

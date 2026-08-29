@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "upload" ]]; then
+  shift
+  exec olcli upload "$@"
+fi
+
+exec olcli "$@"

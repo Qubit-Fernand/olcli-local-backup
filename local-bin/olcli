@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+find_node() {
+  local node version major minor patch score best_node="" best_score=0
+  for node in "$HOME"/.nvm/versions/node/v*/bin/node /opt/homebrew/bin/node /usr/local/bin/node; do
+    [[ -x "$node" ]] || continue
+    version="$("$node" -p 'process.versions.node' 2>/dev/null || true)"
+    IFS=. read -r major minor patch <<< "$version"
+    [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ && "$patch" =~ ^[0-9]+$ ]] || continue
+    if (( major >= 20 )); then
+      score=$((major * 1000000 + minor * 1000 + patch))
+      if (( score > best_score )); then
+        best_score="$score"
+        best_node="$node"
+      fi
+    fi
+  done
+  if [[ -n "$best_node" ]]; then
+    printf '%s\n' "$best_node"
+    return 0
+  fi
+  return 1
+}
+
+find_dist() {
+  local node="$1"
+  local prefix dir
+  prefix="$(cd "$(dirname "$node")/.." && pwd -P)"
+  for dir in \
+    "$prefix/lib/node_modules/@aloth/olcli/dist" \
+    "/opt/homebrew/lib/node_modules/@aloth/olcli/dist" \
+    "$HOME"/.nvm/versions/node/v*/lib/node_modules/@aloth/olcli/dist; do
+    [[ -f "$dir/cli.js" ]] || continue
+    printf '%s\n' "$dir"
+    return 0
+  done
+  return 1
+}
+
+if [[ "${1:-}" == "upload" ]]; then
+  shift
+  use_fig=0
+  show_upload_help=0
+  upload_args=()
+  for arg in "$@"; do
+    if [[ "$arg" == "--fig" ]]; then
+      use_fig=1
+    elif [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+      show_upload_help=1
+      upload_args+=("$arg")
+    else
+      upload_args+=("$arg")
+    fi
+  done
+
+  if [[ "$use_fig" -eq 1 ]]; then
+    exec olupload --fig "${upload_args[@]}"
+  fi
+
+  append_upload_extension_help="$show_upload_help"
+  set -- upload "$@"
+fi
+
+node_bin="$(find_node)" || {
+  echo "olcli: could not find Node.js >= 20" >&2
+  exit 1
+}
+dist_dir="$(find_dist "$node_bin")" || {
+  echo "olcli: could not locate @aloth/olcli/dist" >&2
+  exit 1
+}
+
+if [[ "${append_upload_extension_help:-0}" -eq 1 ]]; then
+  "$node_bin" "$dist_dir/cli.js" "$@"
+  status=$?
+  cat <<'EOF'
+
+Local wrapper extension:
+  --fig              Upload images under figures/, figure/, figs/, or fig/ via olupload --fig
+EOF
+  exit "$status"
+fi
+
+exec "$node_bin" "$dist_dir/cli.js" "$@"

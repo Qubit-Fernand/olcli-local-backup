@@ -1,0 +1,1843 @@
+/**
+ * Overleaf API Client
+ *
+ * Provides programmatic access to Overleaf's REST APIs for project
+ * management, file operations, and LaTeX compilation.
+ */
+import * as cheerio from 'cheerio';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import * as https from 'node:https';
+import * as http from 'node:http';
+// Read version from package.json
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf-8'));
+const USER_AGENT = `olcli/${pkg.version}`;
+const DEFAULT_BASE_URL = 'https://www.overleaf.com';
+const RESOURCE_PATH_FAILURE_HINT = ' (Perhaps the resource file you specified does not exist in the project?)';
+export class OverleafClient {
+    cookies;
+    csrf;
+    baseUrl;
+    verbose = false;
+    timeoutMs = 10000;
+    // Cache per-project folder trees so repeated uploads in sync/upload calls
+    // don't re-fetch the tree via Socket.IO on every file.
+    folderTreeCache = new Map();
+    constructor(credentials) {
+        this.cookies = credentials.cookies;
+        this.csrf = credentials.csrf;
+        this.baseUrl = credentials.baseUrl || DEFAULT_BASE_URL;
+    }
+    /** Enable or disable verbose request/response logging to stderr. */
+    setVerbose(v) {
+        this.verbose = v;
+    }
+    /** Set the global HTTP request timeout in milliseconds. */
+    setGlobalTimeout(ms) {
+        this.timeoutMs = ms;
+    }
+    getCookie(name) {
+        return this.cookies[name];
+    }
+    getSessionCookiePair(preferredCookieName = 'overleaf_session2') {
+        const preferredNames = [
+            preferredCookieName,
+            'overleaf_session2',
+            'overleaf.sid',
+            'sharelatex.sid'
+        ];
+        const seen = new Set();
+        for (const name of preferredNames) {
+            if (seen.has(name))
+                continue;
+            seen.add(name);
+            const value = this.cookies[name];
+            if (value)
+                return { name, value };
+        }
+        const fallback = Object.entries(this.cookies).find(([name]) => (name.toLowerCase().includes('session') || name.toLowerCase().endsWith('.sid')));
+        if (fallback)
+            return { name: fallback[0], value: fallback[1] };
+        const first = Object.entries(this.cookies)[0];
+        return first ? { name: first[0], value: first[1] } : undefined;
+    }
+    /**
+     * Resolve (and cache) the folder tree for a project. Falls back to a
+     * minimal tree containing only the root folder when the Socket.IO probe
+     * fails (e.g. self-hosted Overleaf without that endpoint).
+     */
+    async getOrLoadFolderTree(projectId) {
+        const cached = this.folderTreeCache.get(projectId);
+        if (cached)
+            return cached;
+        let tree = await this.getFolderTreeFromSocket(projectId);
+        if (!tree) {
+            const rootId = await this.getRootFolderId(projectId);
+            tree = { '': rootId };
+        }
+        this.folderTreeCache.set(projectId, tree);
+        return tree;
+    }
+    /** Drop the cached folder tree for a project (e.g. after rename/delete). */
+    invalidateFolderTree(projectId) {
+        this.folderTreeCache.delete(projectId);
+    }
+    projectUrl() {
+        return `${this.baseUrl}/project`;
+    }
+    downloadUrl(projectId) {
+        return `${this.baseUrl}/project/${projectId}/download/zip`;
+    }
+    uploadUrl(projectId) {
+        return `${this.baseUrl}/project/${projectId}/upload`;
+    }
+    folderUrl(projectId) {
+        return `${this.baseUrl}/project/${projectId}/folder`;
+    }
+    deleteUrl(projectId, entityType, entityId) {
+        return `${this.baseUrl}/project/${projectId}/${entityType}/${entityId}`;
+    }
+    compileUrl(projectId) {
+        return `${this.baseUrl}/project/${projectId}/compile?enable_pdf_caching=true`;
+    }
+    /**
+     * Build the request body for the compile endpoint.
+     * Support an optional resourcePath to compile a specific file.
+     */
+    buildCompileRequestBody(resourcePath) {
+        return JSON.stringify({
+            rootDoc_id: null,
+            draft: false,
+            check: 'silent',
+            incrementalCompilesEnabled: true,
+            ...(resourcePath ? { rootResourcePath: resourcePath } : {})
+        });
+    }
+    /**
+     * Create client from session cookie string
+     */
+    static async fromSessionCookie(sessionCookie, baseUrl = DEFAULT_BASE_URL, cookieName = 'overleaf_session2') {
+        const cookies = {
+            [cookieName]: sessionCookie
+        };
+        // Fetch CSRF token from project page
+        const initialHeaders = {
+            'Cookie': Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join('; '),
+            'User-Agent': USER_AGENT
+        };
+        const bootstrapClient = new OverleafClient({ cookies, csrf: 'bootstrap', baseUrl });
+        const response = await bootstrapClient.httpRequest(`${baseUrl}/project`, {
+            headers: initialHeaders,
+            expect: 'text'
+        });
+        if (!response.ok) {
+            throw new Error(`Failed to fetch projects page: ${response.status}`);
+        }
+        bootstrapClient.applySetCookieHeaders(response.headers['set-cookie']);
+        const html = response.body;
+        const $ = cheerio.load(html);
+        if (OverleafClient.isLoginPage($)) {
+            throw new Error('Authentication required. Session may have expired.');
+        }
+        const csrf = OverleafClient.extractCsrfToken($);
+        if (!csrf) {
+            throw new Error('Could not find CSRF token. Session may have expired.');
+        }
+        // Update cookies if the bootstrap request added anything
+        const updatedCookies = bootstrapClient.cookies;
+        return new OverleafClient({ cookies: updatedCookies, csrf, baseUrl });
+    }
+    /**
+     * Create client by submitting Overleaf's email/password login form.
+     */
+    static async fromPasswordLogin(email, password, baseUrl = DEFAULT_BASE_URL) {
+        const bootstrapClient = new OverleafClient({ cookies: {}, csrf: 'bootstrap', baseUrl });
+        const loginPage = await bootstrapClient.httpRequest(`${baseUrl}/login`, {
+            headers: { 'User-Agent': USER_AGENT },
+            expect: 'text'
+        });
+        if (!loginPage.ok) {
+            throw new Error(`Failed to fetch login page: ${loginPage.status}`);
+        }
+        bootstrapClient.applySetCookieHeaders(loginPage.headers['set-cookie']);
+        const loginHtml = loginPage.body;
+        const $login = cheerio.load(loginHtml);
+        const csrf = OverleafClient.extractCsrfToken($login);
+        if (!csrf) {
+            throw new Error('Could not find CSRF token on login page.');
+        }
+        const form = new URLSearchParams();
+        form.set('_csrf', csrf);
+        form.set('email', email);
+        form.set('password', password);
+        const body = form.toString();
+        const loginResponse = await bootstrapClient.httpRequest(`${baseUrl}/login`, {
+            method: 'POST',
+            headers: {
+                'Cookie': bootstrapClient.getCookieHeader(),
+                'User-Agent': USER_AGENT,
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Content-Length': String(Buffer.byteLength(body))
+            },
+            body,
+            expect: 'text',
+            maxRedirects: 0
+        });
+        bootstrapClient.applySetCookieHeaders(loginResponse.headers['set-cookie']);
+        if (![302, 303].includes(loginResponse.status)) {
+            const loginFailure = typeof loginResponse.body === 'string'
+                ? OverleafClient.isLoginPage(cheerio.load(loginResponse.body))
+                : false;
+            if (loginFailure) {
+                throw new Error('Password login failed. Email or password may be incorrect.');
+            }
+            throw new Error(`Password login failed: ${loginResponse.status}`);
+        }
+        const projectUrl = new URL(loginResponse.headers.location || '/project', baseUrl).toString();
+        const projectPage = await bootstrapClient.httpRequest(projectUrl, {
+            headers: {
+                'Cookie': bootstrapClient.getCookieHeader(),
+                'User-Agent': USER_AGENT
+            },
+            expect: 'text'
+        });
+        if (!projectPage.ok) {
+            throw new Error(`Failed to fetch projects page after login: ${projectPage.status}`);
+        }
+        bootstrapClient.applySetCookieHeaders(projectPage.headers['set-cookie']);
+        const projectHtml = projectPage.body;
+        const $project = cheerio.load(projectHtml);
+        if (OverleafClient.isLoginPage($project)) {
+            throw new Error('Password login failed. Still on login page after submitting credentials.');
+        }
+        const projectCsrf = OverleafClient.extractCsrfToken($project);
+        if (!projectCsrf) {
+            throw new Error('Could not find CSRF token after password login.');
+        }
+        return new OverleafClient({ cookies: bootstrapClient.cookies, csrf: projectCsrf, baseUrl });
+    }
+    static extractCsrfToken($) {
+        let csrf = $('meta[name="ol-csrfToken"]').attr('content');
+        if (!csrf) {
+            csrf = $('input[name="_csrf"]').attr('value');
+        }
+        if (!csrf) {
+            const scripts = $('script').toArray();
+            for (const script of scripts) {
+                const content = $(script).html() || '';
+                const match = content.match(/csrfToken["']?\s*[:=]\s*["']([^"']+)["']/);
+                if (match) {
+                    csrf = match[1];
+                    break;
+                }
+            }
+        }
+        return csrf;
+    }
+    static isLoginPage($) {
+        return $('form[name="loginForm"]').length > 0 || $('input[name="password"]').length > 0;
+    }
+    getCookieHeader() {
+        return Object.entries(this.cookies).map(([k, v]) => `${k}=${v}`).join('; ');
+    }
+    getHeaders(includeContentType = false) {
+        const headers = {
+            'Cookie': this.getCookieHeader(),
+            'User-Agent': USER_AGENT,
+            'X-Csrf-Token': this.csrf
+        };
+        if (includeContentType) {
+            headers['Content-Type'] = 'application/json';
+        }
+        return headers;
+    }
+    normalizeHeaders(headers) {
+        const normalized = {};
+        if (!headers)
+            return normalized;
+        for (const [key, value] of Object.entries(headers)) {
+            if (typeof value === 'string') {
+                normalized[key] = value;
+            }
+        }
+        return normalized;
+    }
+    applySetCookieHeaders(setCookie) {
+        if (!setCookie)
+            return;
+        for (const setCookieHeader of setCookie) {
+            const match = setCookieHeader.match(/^([^=]+)=([^;]+)/);
+            if (match) {
+                this.cookies[match[1]] = match[2];
+            }
+        }
+    }
+    logVerbose(...args) {
+        if (this.verbose) {
+            // eslint-disable-next-line no-console
+            console.error('[olcli]', ...args);
+        }
+    }
+    async httpRequest(url, options = {}) {
+        const method = options.method || 'GET';
+        const timeoutMs = options.timeoutMs ?? this.timeoutMs;
+        const maxRedirects = options.maxRedirects ?? 5;
+        const expect = options.expect ?? 'text';
+        // Normalize FormData bodies into a multipart Buffer + headers using Node's
+        // built-in Web Fetch primitives. Keeps every code path on httpRequest
+        // (no fetch() reintroduction) while properly serializing multipart uploads.
+        let bodyBuffer;
+        let extraHeaders = {};
+        if (options.body instanceof FormData) {
+            const req = new Request('http://x/', { method: 'POST', body: options.body });
+            const arrayBuf = await req.arrayBuffer();
+            bodyBuffer = Buffer.from(arrayBuf);
+            const ct = req.headers.get('content-type');
+            if (ct)
+                extraHeaders['Content-Type'] = ct;
+            extraHeaders['Content-Length'] = String(bodyBuffer.length);
+        }
+        else if (options.body !== undefined) {
+            bodyBuffer = options.body;
+        }
+        const doRequest = (reqUrl, redirectsLeft) => {
+            return new Promise((resolve, reject) => {
+                const parsedUrl = new URL(reqUrl);
+                const transport = parsedUrl.protocol === 'https:' ? https : http;
+                const headers = this.normalizeHeaders({ ...extraHeaders, ...options.headers });
+                const req = transport.request(reqUrl, { method, headers }, (res) => {
+                    const status = res.statusCode || 0;
+                    const resHeaders = res.headers;
+                    if (status >= 300 && status < 400 && res.headers.location && redirectsLeft > 0) {
+                        this.logVerbose(`${method} ${reqUrl} -> ${status} redirect -> ${res.headers.location}`);
+                        const redirectUrl = new URL(res.headers.location, reqUrl).toString();
+                        res.resume();
+                        doRequest(redirectUrl, redirectsLeft - 1).then(resolve, reject);
+                        return;
+                    }
+                    const chunks = [];
+                    res.on('data', (chunk) => chunks.push(chunk));
+                    res.on('end', () => {
+                        const buffer = Buffer.concat(chunks);
+                        let body = buffer;
+                        if (expect === 'text') {
+                            body = buffer.toString('utf-8');
+                        }
+                        else if (expect === 'json') {
+                            try {
+                                body = JSON.parse(buffer.toString('utf-8'));
+                            }
+                            catch (e) {
+                                this.logVerbose(`${method} ${reqUrl} -> ${status} (invalid JSON, ${buffer.length} bytes)`);
+                                return reject(new Error(`Failed to parse JSON response from ${reqUrl}`));
+                            }
+                        }
+                        const ok = status >= 200 && status < 300;
+                        if (this.verbose) {
+                            const ct = (resHeaders['content-type'] || '');
+                            let snippet = '';
+                            if (!ok) {
+                                const text = expect === 'buffer' ? '' : (typeof body === 'string' ? body : JSON.stringify(body));
+                                snippet = text ? ` body=${text.slice(0, 200).replace(/\s+/g, ' ')}` : '';
+                            }
+                            this.logVerbose(`${method} ${reqUrl} -> ${status} (${buffer.length}B ${ct})${snippet}`);
+                        }
+                        resolve({ status, ok, headers: resHeaders, body });
+                    });
+                    res.on('error', reject);
+                });
+                req.on('error', reject);
+                if (timeoutMs) {
+                    req.setTimeout(timeoutMs, () => {
+                        req.destroy(new Error(`Request timeout after ${timeoutMs}ms`));
+                    });
+                }
+                if (bodyBuffer !== undefined) {
+                    req.write(bodyBuffer);
+                }
+                req.end();
+            });
+        };
+        return doRequest(url, maxRedirects);
+    }
+    /**
+     * Get all projects (not archived, not trashed)
+     */
+    async listProjects() {
+        const response = await this.httpRequest(this.projectUrl(), {
+            headers: this.getHeaders(),
+            expect: 'text'
+        });
+        if (!response.ok) {
+            throw new Error(`Failed to fetch projects: ${response.status}`);
+        }
+        this.applySetCookieHeaders(response.headers['set-cookie']);
+        const html = response.body;
+        const $ = cheerio.load(html);
+        // Try new Overleaf structure first (PR #82)
+        let projectsData = [];
+        // Method 1: ol-prefetchedProjectsBlob (newest Overleaf)
+        const prefetchedBlob = $('meta[name="ol-prefetchedProjectsBlob"]').attr('content');
+        if (prefetchedBlob) {
+            try {
+                const data = JSON.parse(prefetchedBlob);
+                projectsData = data.projects || data;
+            }
+            catch (e) {
+                // Try next method
+            }
+        }
+        // Method 2: Meta tag with projects content (PR #73)
+        if (projectsData.length === 0) {
+            const metas = $('meta[content]').toArray();
+            for (const meta of metas) {
+                const content = $(meta).attr('content') || '';
+                if (content.includes('"projects"')) {
+                    try {
+                        const data = JSON.parse(content);
+                        if (data.projects) {
+                            projectsData = data.projects;
+                            break;
+                        }
+                    }
+                    catch (e) {
+                        // Continue
+                    }
+                }
+            }
+        }
+        // Method 3: ol-projects meta tag (legacy)
+        if (projectsData.length === 0) {
+            const projectsMeta = $('meta[name="ol-projects"]').attr('content');
+            if (projectsMeta) {
+                try {
+                    projectsData = JSON.parse(projectsMeta);
+                }
+                catch (e) {
+                    // Continue
+                }
+            }
+        }
+        // Filter out archived and trashed
+        return projectsData
+            .filter((p) => !p.archived && !p.trashed)
+            .map((p) => ({
+            id: p.id || p._id,
+            name: p.name,
+            lastUpdated: p.lastUpdated,
+            lastUpdatedBy: p.lastUpdatedBy,
+            owner: p.owner,
+            archived: p.archived,
+            trashed: p.trashed
+        }));
+    }
+    /**
+     * Get project by name
+     */
+    async getProject(name) {
+        const projects = await this.listProjects();
+        return projects.find(p => p.name === name);
+    }
+    /**
+     * Get project by ID
+     */
+    async getProjectById(id) {
+        const projects = await this.listProjects();
+        return projects.find(p => p.id === id);
+    }
+    /**
+     * Get detailed project info including file tree
+     */
+    async getProjectInfo(projectId) {
+        const response = await this.httpRequest(`${this.projectUrl()}/${projectId}`, {
+            headers: this.getHeaders(),
+            expect: 'text'
+        });
+        if (!response.ok) {
+            throw new Error(`Failed to fetch project info: ${response.status}`);
+        }
+        this.applySetCookieHeaders(response.headers['set-cookie']);
+        const html = response.body;
+        const $ = cheerio.load(html);
+        // Look for project data in meta tags
+        let projectInfo;
+        // Try ol-project meta tag
+        const projectMeta = $('meta[name="ol-project"]').attr('content');
+        if (projectMeta) {
+            try {
+                projectInfo = JSON.parse(projectMeta);
+            }
+            catch (e) {
+                // Continue
+            }
+        }
+        // Try to find in other meta tags
+        if (!projectInfo) {
+            const metas = $('meta[content]').toArray();
+            for (const meta of metas) {
+                const content = $(meta).attr('content') || '';
+                if (content.includes('rootFolder')) {
+                    try {
+                        projectInfo = JSON.parse(content);
+                        break;
+                    }
+                    catch (e) {
+                        // Continue
+                    }
+                }
+            }
+        }
+        // Fallback: Overleaf no longer ships the project tree in meta tags.
+        // Use the Socket.IO joinProjectResponse payload (same source used for
+        // root folder discovery) to retrieve the full project info.
+        if (!projectInfo) {
+            const socketProject = await this.getProjectFromSocket(projectId);
+            if (socketProject) {
+                projectInfo = socketProject;
+            }
+        }
+        if (!projectInfo) {
+            throw new Error('Could not parse project info');
+        }
+        return projectInfo;
+    }
+    /**
+     * Fetch the full project object via the collaboration socket.
+     * Returns the `project` field of the joinProjectResponse, which contains
+     * the rootFolder tree and other metadata that used to live in ol-project.
+     */
+    async getProjectFromSocket(projectId) {
+        let sid = null;
+        try {
+            const handshakeUrl = `${this.baseUrl}/socket.io/1/?projectId=${encodeURIComponent(projectId)}&t=${Date.now()}`;
+            const handshakeResponse = await this.httpRequest(handshakeUrl, {
+                headers: { 'Cookie': this.getCookieHeader(), 'User-Agent': USER_AGENT },
+                expect: 'text',
+                timeoutMs: 5000
+            });
+            if (!handshakeResponse.ok)
+                return null;
+            this.applySetCookieHeaders(handshakeResponse.headers['set-cookie']);
+            const handshakeBody = handshakeResponse.body.trim();
+            sid = handshakeBody.split(':')[0];
+            if (!sid)
+                return null;
+            const buildPollUrl = () => `${this.baseUrl}/socket.io/1/xhr-polling/${sid}?projectId=${encodeURIComponent(projectId)}&t=${Date.now()}`;
+            for (let attempt = 0; attempt < 6; attempt++) {
+                const pollResponse = await this.httpRequest(buildPollUrl(), {
+                    headers: { 'Cookie': this.getCookieHeader(), 'User-Agent': USER_AGENT },
+                    expect: 'text',
+                    timeoutMs: 5000
+                });
+                if (!pollResponse.ok)
+                    return null;
+                this.applySetCookieHeaders(pollResponse.headers['set-cookie']);
+                const packets = this.decodeSocketIoPayload(pollResponse.body);
+                for (const packet of packets) {
+                    if (packet.startsWith('5:::')) {
+                        try {
+                            const payload = JSON.parse(packet.slice(4));
+                            if (payload?.name === 'joinProjectResponse' && payload?.args?.[0]?.project) {
+                                return payload.args[0].project;
+                            }
+                        }
+                        catch { /* ignore */ }
+                    }
+                    if (packet.startsWith('2::')) {
+                        const heartbeatResponse = await this.httpRequest(buildPollUrl(), {
+                            method: 'POST',
+                            headers: {
+                                'Cookie': this.getCookieHeader(),
+                                'User-Agent': USER_AGENT,
+                                'Content-Type': 'text/plain;charset=UTF-8'
+                            },
+                            body: '2::',
+                            expect: 'text',
+                            timeoutMs: 5000
+                        });
+                        this.applySetCookieHeaders(heartbeatResponse.headers['set-cookie']);
+                    }
+                }
+            }
+        }
+        catch {
+            // fall through
+        }
+        finally {
+            if (sid) {
+                try {
+                    const disconnectUrl = `${this.baseUrl}/socket.io/1/xhr-polling/${sid}?projectId=${encodeURIComponent(projectId)}&t=${Date.now()}`;
+                    const disconnectResponse = await this.httpRequest(disconnectUrl, {
+                        method: 'POST',
+                        headers: {
+                            'Cookie': this.getCookieHeader(),
+                            'User-Agent': USER_AGENT,
+                            'Content-Type': 'text/plain;charset=UTF-8'
+                        },
+                        body: '0::',
+                        expect: 'text',
+                        timeoutMs: 5000
+                    });
+                    this.applySetCookieHeaders(disconnectResponse.headers['set-cookie']);
+                }
+                catch { /* ignore */ }
+            }
+        }
+        return null;
+    }
+    /**
+     * Download a URL as a Buffer using Node.js http/https modules.
+     *
+     * This avoids fetch's strict header validation which rejects non-Latin1
+     * characters in response headers (e.g. Content-Disposition with Unicode
+     * project names). See: https://github.com/aloth/olcli/issues/2
+     */
+    async downloadBuffer(url, timeoutMs) {
+        const response = await this.httpRequest(url, {
+            headers: this.getHeaders(),
+            expect: 'buffer',
+            timeoutMs
+        });
+        if (!response.ok) {
+            throw new Error(`Download failed: ${response.status}`);
+        }
+        this.applySetCookieHeaders(response.headers['set-cookie']);
+        return response.body;
+    }
+    /**
+     * Download project as zip
+     *
+     * Uses downloadBuffer to avoid ByteString errors from non-Latin1
+     * Content-Disposition headers. See: https://github.com/aloth/olcli/issues/2
+     */
+    async downloadProject(projectId, timeoutMs) {
+        return this.downloadBuffer(this.downloadUrl(projectId), timeoutMs);
+    }
+    /**
+     * Compile project and get PDF
+     */
+    async compileProject(projectId, resourcePath) {
+        const response = await this.httpRequest(this.compileUrl(projectId), {
+            method: 'POST',
+            headers: this.getHeaders(true),
+            body: this.buildCompileRequestBody(resourcePath),
+            expect: 'json'
+        });
+        if (!response.ok) {
+            throw new Error(`Failed to compile project: ${response.status}`);
+        }
+        this.applySetCookieHeaders(response.headers['set-cookie']);
+        const data = response.body;
+        if (data.status !== 'success') {
+            throw new Error(`Compilation failed: ${data.status}${resourcePath ? RESOURCE_PATH_FAILURE_HINT : ''}`);
+        }
+        // Match by path 'output.pdf' — Overleaf's CLSI always names the main
+        // compile output 'output.pdf'. Matching only on type === 'pdf' can pick up
+        // figure PDFs or *-eps-converted-to.pdf intermediates. See #26.
+        const pdfFile = data.outputFiles?.find((f) => f.path === 'output.pdf')
+            || data.outputFiles?.find((f) => f.type === 'pdf');
+        if (!pdfFile) {
+            throw new Error('No PDF output found');
+        }
+        // Overleaf's CDN requires ?clsiserverid=<id> for build-output downloads.
+        // Without it the build URL 404s. See: https://github.com/aloth/olcli/issues/22
+        const qs = data.clsiServerId ? `?clsiserverid=${encodeURIComponent(data.clsiServerId)}` : '';
+        return {
+            pdfUrl: `${this.baseUrl}${pdfFile.url}${qs}`,
+            logs: data.compileGroup ? [`Compile group: ${data.compileGroup}`] : []
+        };
+    }
+    /**
+     * Download compiled PDF
+     */
+    async downloadPdf(projectId, timeoutMs, resourcePath) {
+        const { pdfUrl } = await this.compileProject(projectId, resourcePath);
+        return this.downloadBuffer(pdfUrl, timeoutMs);
+    }
+    /**
+     * Create a folder in a project
+     */
+    async createFolder(projectId, parentFolderId, name) {
+        const response = await this.httpRequest(this.folderUrl(projectId), {
+            method: 'POST',
+            headers: this.getHeaders(true),
+            body: JSON.stringify({
+                parent_folder_id: parentFolderId,
+                name
+            }),
+            expect: 'json'
+        });
+        if (response.status === 400) {
+            // Folder already exists
+            throw new Error('Folder already exists');
+        }
+        if (!response.ok) {
+            throw new Error(`Failed to create folder: ${response.status}`);
+        }
+        this.applySetCookieHeaders(response.headers['set-cookie']);
+        const data = response.body;
+        return data._id;
+    }
+    /**
+     * Compute root folder ID from project ID
+     * MongoDB ObjectIDs are 24 hex chars. The root folder ID is typically projectId - 1
+     */
+    computeRootFolderId(projectId) {
+        // Parse the last 8 chars as a hex number (the counter portion)
+        const prefix = projectId.slice(0, 16);
+        const suffix = projectId.slice(16);
+        const counter = parseInt(suffix, 16);
+        const newCounter = (counter - 1).toString(16).padStart(8, '0');
+        return prefix + newCounter;
+    }
+    /**
+     * Decode Socket.IO 0.9 payloads. Frames may be a single packet or \ufffd-length framed packets.
+     */
+    decodeSocketIoPayload(payload) {
+        if (!payload)
+            return [];
+        if (!payload.startsWith('\ufffd'))
+            return [payload];
+        const packets = [];
+        let i = 0;
+        while (i < payload.length) {
+            if (payload[i] !== '\ufffd')
+                break;
+            i += 1;
+            let len = '';
+            while (i < payload.length && payload[i] !== '\ufffd') {
+                len += payload[i];
+                i += 1;
+            }
+            if (i >= payload.length || payload[i] !== '\ufffd')
+                break;
+            i += 1;
+            const packetLen = Number.parseInt(len, 10);
+            if (!Number.isFinite(packetLen) || packetLen < 0)
+                break;
+            packets.push(payload.slice(i, i + packetLen));
+            i += packetLen;
+        }
+        return packets;
+    }
+    encodeSocketIoEvent(id, name, args) {
+        return `5:${id}+::${JSON.stringify({ name, args })}`;
+    }
+    parseSocketIoAck(packet, id) {
+        const match = packet.match(/^6:::(\d+)(.*)$/);
+        if (!match || Number.parseInt(match[1], 10) !== id) {
+            return null;
+        }
+        let payload = match[2] || '';
+        if (payload.startsWith('+')) {
+            payload = payload.slice(1);
+        }
+        if (!payload)
+            return [];
+        const args = JSON.parse(payload);
+        return Array.isArray(args) ? args : [args];
+    }
+    decodeOverleafUtf8(text) {
+        return Buffer.from(text, 'binary').toString('utf-8');
+    }
+    generateCommentThreadId() {
+        const timestamp = Math.floor(Date.now() / 1000).toString(16).padStart(8, '0');
+        const machine = Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, '0');
+        const pid = Math.floor(Math.random() * 0x7fff).toString(16).padStart(4, '0');
+        return `${timestamp}${machine}${pid}000001`;
+    }
+    positionToLineColumn(content, position) {
+        const prefix = content.slice(0, position);
+        const lines = prefix.split('\n');
+        return {
+            line: lines.length,
+            column: lines[lines.length - 1].length + 1
+        };
+    }
+    buildCommentContext(content, line, contextLines = 0) {
+        if (contextLines <= 0)
+            return undefined;
+        const lines = content.split('\n');
+        const lineIndex = line - 1;
+        const beforeStart = Math.max(0, lineIndex - contextLines);
+        const afterEnd = Math.min(lines.length, lineIndex + contextLines + 1);
+        return {
+            startLine: beforeStart + 1,
+            endLine: afterEnd,
+            before: lines.slice(beforeStart, lineIndex),
+            line: lines[lineIndex] || '',
+            after: lines.slice(lineIndex + 1, afterEnd)
+        };
+    }
+    collectProjectDocs(projectInfo) {
+        const docs = [];
+        function walk(folder, folderPath) {
+            for (const doc of folder.docs || []) {
+                docs.push({
+                    id: doc._id,
+                    path: folderPath ? `${folderPath}/${doc.name}` : doc.name
+                });
+            }
+            for (const child of folder.folders || []) {
+                const childPath = folderPath ? `${folderPath}/${child.name}` : child.name;
+                walk(child, childPath);
+            }
+        }
+        for (const folder of projectInfo.rootFolder || []) {
+            walk(folder, '');
+        }
+        return docs;
+    }
+    async openProjectSocket(projectId) {
+        const handshakeUrl = `${this.baseUrl}/socket.io/1/?projectId=${encodeURIComponent(projectId)}&t=${Date.now()}`;
+        const handshakeResponse = await this.httpRequest(handshakeUrl, {
+            headers: { 'Cookie': this.getCookieHeader(), 'User-Agent': USER_AGENT },
+            expect: 'text',
+            timeoutMs: 5000
+        });
+        if (!handshakeResponse.ok) {
+            throw new Error(`Failed to open project socket: ${handshakeResponse.status}`);
+        }
+        this.applySetCookieHeaders(handshakeResponse.headers['set-cookie']);
+        const sid = handshakeResponse.body.trim().split(':')[0];
+        if (!sid) {
+            throw new Error('Failed to open project socket: missing session id');
+        }
+        const session = {
+            sid,
+            projectId,
+            pollUrl: () => `${this.baseUrl}/socket.io/1/xhr-polling/${sid}?projectId=${encodeURIComponent(projectId)}&t=${Date.now()}`
+        };
+        for (let attempt = 0; attempt < 8; attempt++) {
+            const packets = await this.pollProjectSocket(session);
+            if (packets.some(packet => {
+                if (!packet.startsWith('5:::'))
+                    return false;
+                try {
+                    return JSON.parse(packet.slice(4))?.name === 'joinProjectResponse';
+                }
+                catch {
+                    return false;
+                }
+            })) {
+                return session;
+            }
+        }
+        throw new Error('Project socket did not return joinProjectResponse');
+    }
+    async pollProjectSocket(session) {
+        const response = await this.httpRequest(session.pollUrl(), {
+            headers: { 'Cookie': this.getCookieHeader(), 'User-Agent': USER_AGENT },
+            expect: 'text',
+            timeoutMs: 7000
+        });
+        if (!response.ok) {
+            throw new Error(`Socket poll failed: ${response.status}`);
+        }
+        this.applySetCookieHeaders(response.headers['set-cookie']);
+        const packets = this.decodeSocketIoPayload(response.body);
+        for (const packet of packets) {
+            if (packet.startsWith('2::')) {
+                const heartbeatResponse = await this.httpRequest(session.pollUrl(), {
+                    method: 'POST',
+                    headers: {
+                        'Cookie': this.getCookieHeader(),
+                        'User-Agent': USER_AGENT,
+                        'Content-Type': 'text/plain;charset=UTF-8'
+                    },
+                    body: '2::',
+                    expect: 'text',
+                    timeoutMs: 5000
+                });
+                this.applySetCookieHeaders(heartbeatResponse.headers['set-cookie']);
+            }
+        }
+        return packets;
+    }
+    async postProjectSocketPacket(session, packet) {
+        const response = await this.httpRequest(session.pollUrl(), {
+            method: 'POST',
+            headers: {
+                'Cookie': this.getCookieHeader(),
+                'User-Agent': USER_AGENT,
+                'Content-Type': 'text/plain;charset=UTF-8'
+            },
+            body: packet,
+            expect: 'text',
+            timeoutMs: 5000
+        });
+        if (!response.ok) {
+            throw new Error(`Socket post failed: ${response.status}`);
+        }
+        this.applySetCookieHeaders(response.headers['set-cookie']);
+    }
+    async socketRpc(session, name, args) {
+        const id = Math.floor(Math.random() * 0x7fffffff);
+        await this.postProjectSocketPacket(session, this.encodeSocketIoEvent(id, name, args));
+        for (let attempt = 0; attempt < 10; attempt++) {
+            const packets = await this.pollProjectSocket(session);
+            for (const packet of packets) {
+                const ackArgs = this.parseSocketIoAck(packet, id);
+                if (ackArgs) {
+                    const [error, ...result] = ackArgs;
+                    if (error) {
+                        const message = typeof error === 'string' ? error : error.message || JSON.stringify(error);
+                        throw new Error(`${name} failed: ${message}`);
+                    }
+                    return result;
+                }
+            }
+        }
+        throw new Error(`${name} did not return an acknowledgement`);
+    }
+    async closeProjectSocket(session) {
+        try {
+            await this.postProjectSocketPacket(session, '0::');
+        }
+        catch {
+            // Best-effort socket cleanup only.
+        }
+    }
+    normalizeJoinedDocument(docId, args) {
+        const [lines, version, _updates, ranges, type = 'sharejs-text-ot'] = args;
+        if (type === 'history-ot') {
+            const content = typeof lines?.content === 'string' ? lines.content : '';
+            return {
+                docId,
+                lines: content.split('\n'),
+                content,
+                version,
+                ranges: lines,
+                type
+            };
+        }
+        const decodedLines = Array.isArray(lines)
+            ? lines.map((line) => this.decodeOverleafUtf8(line))
+            : [];
+        const decodedRanges = ranges || {};
+        for (const comment of decodedRanges.comments || []) {
+            if (comment?.op?.c) {
+                comment.op.c = this.decodeOverleafUtf8(comment.op.c);
+            }
+        }
+        return {
+            docId,
+            lines: decodedLines,
+            content: decodedLines.join('\n'),
+            version,
+            ranges: decodedRanges,
+            type
+        };
+    }
+    async joinDocument(session, docId) {
+        const args = await this.socketRpc(session, 'joinDoc', [
+            docId,
+            {
+                encodeRanges: true,
+                supportsHistoryOT: true
+            }
+        ]);
+        return this.normalizeJoinedDocument(docId, args);
+    }
+    /**
+     * Extract root folder ID from a Socket.IO event packet (joinProjectResponse).
+     */
+    extractRootFolderIdFromSocketPacket(packet) {
+        if (!packet.startsWith('5:::'))
+            return null;
+        try {
+            const payload = JSON.parse(packet.slice(4));
+            if (payload?.name !== 'joinProjectResponse')
+                return null;
+            const rootFolderId = payload?.args?.[0]?.project?.rootFolder?.[0]?._id;
+            return typeof rootFolderId === 'string' ? rootFolderId : null;
+        }
+        catch {
+            return null;
+        }
+    }
+    /**
+     * Extract full folder tree from a Socket.IO joinProjectResponse packet.
+     * Returns a map of folder path -> folder ID, e.g. { '': rootId, 'figures': figuresId }
+     */
+    extractFolderTreeFromSocketPacket(packet) {
+        if (!packet.startsWith('5:::'))
+            return null;
+        try {
+            const payload = JSON.parse(packet.slice(4));
+            if (payload?.name !== 'joinProjectResponse')
+                return null;
+            const rootFolder = payload?.args?.[0]?.project?.rootFolder?.[0];
+            if (!rootFolder?._id)
+                return null;
+            const folderMap = {};
+            function walkFolders(folder, currentPath) {
+                folderMap[currentPath] = folder._id;
+                for (const sub of folder.folders || []) {
+                    const subPath = currentPath ? `${currentPath}/${sub.name}` : sub.name;
+                    walkFolders(sub, subPath);
+                }
+            }
+            walkFolders(rootFolder, '');
+            return folderMap;
+        }
+        catch {
+            return null;
+        }
+    }
+    /**
+     * main problem to resolve root folder ID from Overleaf's collaboration join payload
+     * authoritative for projects where ObjectID arithmetic does not apply
+     */
+    async getRootFolderIdFromSocket(projectId) {
+        let sid = null;
+        try {
+            const handshakeUrl = `${this.baseUrl}/socket.io/1/?projectId=${encodeURIComponent(projectId)}&t=${Date.now()}`;
+            const handshakeResponse = await this.httpRequest(handshakeUrl, {
+                headers: {
+                    'Cookie': this.getCookieHeader(),
+                    'User-Agent': USER_AGENT
+                },
+                expect: 'text',
+                timeoutMs: 5000
+            });
+            if (!handshakeResponse.ok)
+                return null;
+            this.applySetCookieHeaders(handshakeResponse.headers['set-cookie']);
+            const handshakeBody = handshakeResponse.body.trim();
+            sid = handshakeBody.split(':')[0];
+            if (!sid)
+                return null;
+            const buildPollUrl = () => `${this.baseUrl}/socket.io/1/xhr-polling/${sid}?projectId=${encodeURIComponent(projectId)}&t=${Date.now()}`;
+            let discoveredRootFolderId = null;
+            // poll a few frames, first is usually connect ack, next includes joinProjectResponse
+            for (let attempt = 0; attempt < 3; attempt++) {
+                const pollResponse = await this.httpRequest(buildPollUrl(), {
+                    headers: {
+                        'Cookie': this.getCookieHeader(),
+                        'User-Agent': USER_AGENT
+                    },
+                    expect: 'text',
+                    timeoutMs: 5000
+                });
+                if (!pollResponse.ok)
+                    return null;
+                this.applySetCookieHeaders(pollResponse.headers['set-cookie']);
+                const payload = pollResponse.body;
+                const packets = this.decodeSocketIoPayload(payload);
+                for (const packet of packets) {
+                    const rootFolderId = this.extractRootFolderIdFromSocketPacket(packet);
+                    if (rootFolderId) {
+                        discoveredRootFolderId = rootFolderId;
+                        break;
+                    }
+                    if (packet.startsWith('2::')) {
+                        //reply to heartbeat to keep polling transport alive
+                        const heartbeatResponse = await this.httpRequest(buildPollUrl(), {
+                            method: 'POST',
+                            headers: {
+                                'Cookie': this.getCookieHeader(),
+                                'User-Agent': USER_AGENT,
+                                'Content-Type': 'text/plain;charset=UTF-8'
+                            },
+                            body: '2::',
+                            expect: 'text',
+                            timeoutMs: 5000
+                        });
+                        this.applySetCookieHeaders(heartbeatResponse.headers['set-cookie']);
+                    }
+                }
+                if (discoveredRootFolderId) {
+                    return discoveredRootFolderId;
+                }
+            }
+        }
+        catch {
+            // Fall back to non-socket methods.
+        }
+        finally {
+            if (sid) {
+                try {
+                    const disconnectUrl = `${this.baseUrl}/socket.io/1/xhr-polling/${sid}?projectId=${encodeURIComponent(projectId)}&t=${Date.now()}`;
+                    const disconnectResponse = await this.httpRequest(disconnectUrl, {
+                        method: 'POST',
+                        headers: {
+                            'Cookie': this.getCookieHeader(),
+                            'User-Agent': USER_AGENT,
+                            'Content-Type': 'text/plain;charset=UTF-8'
+                        },
+                        body: '0::',
+                        expect: 'text',
+                        timeoutMs: 5000
+                    });
+                    this.applySetCookieHeaders(disconnectResponse.headers['set-cookie']);
+                }
+                catch {
+                    // Ignore cleanup failures.
+                }
+            }
+        }
+        return null;
+    }
+    /**
+     * Get full folder tree for a project via Socket.IO.
+     * Returns a map of folder path -> folder ID, e.g. { '': rootId, 'figures': figuresId }
+     */
+    async getFolderTreeFromSocket(projectId) {
+        let sid = null;
+        try {
+            const handshakeUrl = `${this.baseUrl}/socket.io/1/?projectId=${encodeURIComponent(projectId)}&t=${Date.now()}`;
+            const handshakeResponse = await this.httpRequest(handshakeUrl, {
+                headers: {
+                    'Cookie': this.getCookieHeader(),
+                    'User-Agent': USER_AGENT
+                },
+                expect: 'text',
+                timeoutMs: 5000
+            });
+            if (!handshakeResponse.ok)
+                return null;
+            this.applySetCookieHeaders(handshakeResponse.headers['set-cookie']);
+            const handshakeBody = handshakeResponse.body.trim();
+            sid = handshakeBody.split(':')[0];
+            if (!sid)
+                return null;
+            const buildPollUrl = () => `${this.baseUrl}/socket.io/1/xhr-polling/${sid}?projectId=${encodeURIComponent(projectId)}&t=${Date.now()}`;
+            for (let attempt = 0; attempt < 3; attempt++) {
+                const pollResponse = await this.httpRequest(buildPollUrl(), {
+                    headers: {
+                        'Cookie': this.getCookieHeader(),
+                        'User-Agent': USER_AGENT
+                    },
+                    expect: 'text',
+                    timeoutMs: 5000
+                });
+                if (!pollResponse.ok)
+                    return null;
+                this.applySetCookieHeaders(pollResponse.headers['set-cookie']);
+                const payload = pollResponse.body;
+                const packets = this.decodeSocketIoPayload(payload);
+                for (const packet of packets) {
+                    const folderTree = this.extractFolderTreeFromSocketPacket(packet);
+                    if (folderTree)
+                        return folderTree;
+                    if (packet.startsWith('2::')) {
+                        const heartbeatResponse = await this.httpRequest(buildPollUrl(), {
+                            method: 'POST',
+                            headers: {
+                                'Cookie': this.getCookieHeader(),
+                                'User-Agent': USER_AGENT,
+                                'Content-Type': 'text/plain;charset=UTF-8'
+                            },
+                            body: '2::',
+                            expect: 'text',
+                            timeoutMs: 5000
+                        });
+                        this.applySetCookieHeaders(heartbeatResponse.headers['set-cookie']);
+                    }
+                }
+            }
+        }
+        catch {
+            // Fall back
+        }
+        finally {
+            if (sid) {
+                try {
+                    const disconnectUrl = `${this.baseUrl}/socket.io/1/xhr-polling/${sid}?projectId=${encodeURIComponent(projectId)}&t=${Date.now()}`;
+                    await this.httpRequest(disconnectUrl, {
+                        method: 'POST',
+                        headers: {
+                            'Cookie': this.getCookieHeader(),
+                            'User-Agent': USER_AGENT,
+                            'Content-Type': 'text/plain;charset=UTF-8'
+                        },
+                        body: '0::',
+                        expect: 'text',
+                        timeoutMs: 5000
+                    });
+                }
+                catch {
+                    // Ignore cleanup failures.
+                }
+            }
+        }
+        return null;
+    }
+    /**
+     * Resolve a folder path to a folder ID, creating missing folders as needed.
+     * folderTree is a map of path -> ID (fetched once per push session).
+     * folderPath is e.g. 'figures' or 'a/b/c'.
+     */
+    async resolveFolderId(projectId, folderTree, folderPath) {
+        if (!folderPath || folderPath === '')
+            return folderTree[''];
+        if (folderTree[folderPath])
+            return folderTree[folderPath];
+        // Create each missing segment
+        const segments = folderPath.split('/');
+        let currentPath = '';
+        for (const segment of segments) {
+            const parentPath = currentPath;
+            currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+            if (folderTree[currentPath])
+                continue;
+            const parentId = folderTree[parentPath];
+            if (!parentId)
+                throw new Error(`Cannot resolve parent folder for: ${currentPath}`);
+            try {
+                const newId = await this.createFolder(projectId, parentId, segment);
+                folderTree[currentPath] = newId;
+            }
+            catch (e) {
+                if (e.message === 'Folder already exists') {
+                    // Folder exists but we don't have its ID - re-fetch tree
+                    const freshTree = await this.getFolderTreeFromSocket(projectId);
+                    if (freshTree?.[currentPath]) {
+                        folderTree[currentPath] = freshTree[currentPath];
+                    }
+                    else {
+                        throw new Error(`Folder '${currentPath}' exists but could not resolve its ID`);
+                    }
+                }
+                else {
+                    throw e;
+                }
+            }
+        }
+        return folderTree[folderPath];
+    }
+    /**
+     * Get root folder ID for a project (tries multiple methods)
+     */
+    async getRootFolderId(projectId) {
+        // Method 1: Try to get from project page meta tags
+        try {
+            const projectInfo = await this.getProjectInfo(projectId);
+            if (projectInfo.rootFolder?.[0]?._id) {
+                return projectInfo.rootFolder[0]._id;
+            }
+        }
+        catch (e) {
+            // Fall through to computed method
+        }
+        // Method 2: Ask collaboration socket (authoritative project tree)
+        const socketRootFolderId = await this.getRootFolderIdFromSocket(projectId);
+        if (socketRootFolderId) {
+            return socketRootFolderId;
+        }
+        // Method 3: Compute from project ID (projectId - 1)
+        return this.computeRootFolderId(projectId);
+    }
+    /**
+     * Find root folder ID by probing multiple candidates
+     * This handles cases where projectId - 1 doesn't work
+     */
+    async probeRootFolderId(projectId) {
+        const candidates = [];
+        // Method 1: Try projectId - 1 (most common)
+        candidates.push(this.computeRootFolderId(projectId));
+        const prefix = projectId.slice(0, 16);
+        const suffix = parseInt(projectId.slice(16), 16);
+        // Method 2: Try a wide range around the project ID
+        // Some projects have root folder created with different offsets
+        for (let i = 2; i <= 50; i++) {
+            if (suffix - i >= 0) {
+                candidates.push(prefix + (suffix - i).toString(16).padStart(8, '0'));
+            }
+        }
+        for (let i = 1; i <= 50; i++) {
+            candidates.push(prefix + (suffix + i).toString(16).padStart(8, '0'));
+        }
+        // Test each candidate with a minimal probe request
+        for (const folderId of candidates) {
+            try {
+                // Try to create a temp file to probe the folder
+                const testFileName = `.olcli-probe-${Date.now()}.tmp`;
+                const formData = new FormData();
+                formData.append('targetFolderId', folderId);
+                formData.append('name', testFileName);
+                formData.append('type', 'text/plain');
+                formData.append('qqfile', new Blob(['probe']), testFileName);
+                const response = await this.httpRequest(`${this.uploadUrl(projectId)}?folder_id=${folderId}`, {
+                    method: 'POST',
+                    headers: {
+                        'Cookie': this.getCookieHeader(),
+                        'User-Agent': USER_AGENT,
+                        'X-Csrf-Token': this.csrf
+                    },
+                    body: formData,
+                    expect: 'json'
+                });
+                if (!response.ok) {
+                    continue;
+                }
+                this.applySetCookieHeaders(response.headers['set-cookie']);
+                const data = response.body;
+                if (data.success !== false && data.entity_id) {
+                    // Success! Delete the probe file and return this folder ID
+                    try {
+                        await this.deleteEntity(projectId, data.entity_id, 'doc');
+                    }
+                    catch (e) {
+                        // Ignore delete errors for probe file
+                    }
+                    return folderId;
+                }
+            }
+            catch (e) {
+                // Continue to next candidate
+            }
+        }
+        return null;
+    }
+    /**
+     * Upload a file to a project.
+     * If folderTree is provided and fileName contains a path (e.g. 'figures/img.png'),
+     * the file will be uploaded into the correct subfolder, creating it if needed.
+     */
+    async uploadFile(projectId, folderId, fileName, content, folderTree) {
+        // Extract just the filename without path
+        const baseName = fileName.split('/').pop() || fileName;
+        // Resolve target folder: if fileName has a directory part, place the file there.
+        // Lazy-load + cache the folder tree when caller didn't supply one, so external
+        // callers (and our own `upload`/`sync` paths) don't silently dump files into root.
+        // See: https://github.com/aloth/olcli/issues/22 follow-up + 0.3.1 upload-fix.
+        const dirPart = fileName.includes('/') ? fileName.split('/').slice(0, -1).join('/') : '';
+        let targetFolderId;
+        if (dirPart) {
+            const tree = folderTree || await this.getOrLoadFolderTree(projectId);
+            targetFolderId = await this.resolveFolderId(projectId, tree, dirPart);
+        }
+        else {
+            targetFolderId = folderId || await this.getRootFolderId(projectId);
+        }
+        // Determine MIME type
+        const ext = baseName.split('.').pop()?.toLowerCase() || '';
+        const mimeTypes = {
+            'tex': 'text/x-tex',
+            'bib': 'text/x-bibtex',
+            'cls': 'text/x-tex',
+            'sty': 'text/x-tex',
+            'png': 'image/png',
+            'jpg': 'image/jpeg',
+            'jpeg': 'image/jpeg',
+            'gif': 'image/gif',
+            'pdf': 'application/pdf',
+            'svg': 'image/svg+xml',
+            'eps': 'application/postscript'
+        };
+        const mimeType = mimeTypes[ext] || 'application/octet-stream';
+        // Helper function to attempt upload with a specific folder ID
+        const tryUpload = async (fid) => {
+            const formData = new FormData();
+            formData.append('targetFolderId', fid);
+            formData.append('name', baseName);
+            formData.append('type', mimeType);
+            formData.append('qqfile', new Blob([content]), baseName);
+            const response = await this.httpRequest(`${this.uploadUrl(projectId)}?folder_id=${encodeURIComponent(fid)}`, {
+                method: 'POST',
+                headers: {
+                    'Cookie': this.getCookieHeader(),
+                    'User-Agent': USER_AGENT,
+                    'X-Csrf-Token': this.csrf
+                },
+                body: formData,
+                expect: 'text'
+            });
+            if (!response.ok) {
+                const text = response.body;
+                // Overleaf returns folder_not_found as HTTP 422 JSON.
+                // Parse the body first so caller can trigger folder probing fallback.
+                try {
+                    const data = JSON.parse(text);
+                    if (data?.error === 'folder_not_found') {
+                        return { success: false, error: 'folder_not_found' };
+                    }
+                }
+                catch (e) {
+                    // Ignore non-JSON responses and return generic HTTP error below.
+                }
+                return { success: false, error: `${response.status} - ${text}` };
+            }
+            this.applySetCookieHeaders(response.headers['set-cookie']);
+            const data = JSON.parse(response.body);
+            if (data.success === false && data.error === 'folder_not_found') {
+                return { success: false, error: 'folder_not_found' };
+            }
+            return {
+                success: data.success !== false,
+                entityId: data.entity_id,
+                entityType: data.entity_type
+            };
+        };
+        // First attempt with computed/cached folder ID
+        let result = await tryUpload(targetFolderId);
+        // If cached folder ID is stale, re-resolve root folder ID and retry once.
+        if (!result.success && result.error === 'folder_not_found') {
+            const refreshedRootFolderId = await this.getRootFolderId(projectId);
+            if (refreshedRootFolderId !== targetFolderId) {
+                targetFolderId = refreshedRootFolderId;
+                result = await tryUpload(targetFolderId);
+            }
+        }
+        // If folder is still unresolved, probe for a valid root folder ID
+        if (!result.success && result.error === 'folder_not_found') {
+            const probedFolderId = await this.probeRootFolderId(projectId);
+            if (probedFolderId && probedFolderId !== targetFolderId) {
+                targetFolderId = probedFolderId;
+                result = await tryUpload(targetFolderId);
+            }
+        }
+        if (!result.success) {
+            throw new Error(`Failed to upload file: ${result.error || 'unknown error'}`);
+        }
+        return {
+            success: result.success,
+            entityId: result.entityId,
+            entityType: result.entityType
+        };
+    }
+    /**
+     * Delete a file or folder
+     */
+    async deleteEntity(projectId, entityId, entityType) {
+        const url = this.deleteUrl(projectId, entityType, entityId);
+        const response = await this.httpRequest(url, {
+            method: 'DELETE',
+            headers: this.getHeaders(),
+            expect: 'text'
+        });
+        if (!response.ok) {
+            throw new Error(`Failed to delete entity: ${response.status}`);
+        }
+        this.applySetCookieHeaders(response.headers['set-cookie']);
+    }
+    /**
+     * Get list of entities (files/docs) with paths
+     */
+    async getEntities(projectId) {
+        const response = await this.httpRequest(`${this.baseUrl}/project/${projectId}/entities`, {
+            headers: this.getHeaders(),
+            expect: 'json'
+        });
+        if (!response.ok) {
+            throw new Error(`Failed to get entities: ${response.status}`);
+        }
+        this.applySetCookieHeaders(response.headers['set-cookie']);
+        const data = response.body;
+        return data.entities || [];
+    }
+    /**
+     * Find entity ID by path (searches through project file tree)
+     */
+    async findEntityByPath(projectId, targetPath) {
+        const projectInfo = await this.getProjectInfo(projectId);
+        const normalizedTarget = targetPath.replace(/^\//, '');
+        function searchFolder(folder, currentPath) {
+            // Check docs
+            for (const doc of folder.docs || []) {
+                const docPath = currentPath ? `${currentPath}/${doc.name}` : doc.name;
+                if (docPath === normalizedTarget || doc.name === normalizedTarget) {
+                    return { id: doc._id, type: 'doc', name: doc.name };
+                }
+            }
+            // Check files
+            for (const file of folder.fileRefs || []) {
+                const filePath = currentPath ? `${currentPath}/${file.name}` : file.name;
+                if (filePath === normalizedTarget || file.name === normalizedTarget) {
+                    return { id: file._id, type: 'file', name: file.name };
+                }
+            }
+            // Check subfolders
+            for (const subfolder of folder.folders || []) {
+                const folderPath = currentPath ? `${currentPath}/${subfolder.name}` : subfolder.name;
+                if (folderPath === normalizedTarget || subfolder.name === normalizedTarget) {
+                    return { id: subfolder._id, type: 'folder', name: subfolder.name };
+                }
+                const found = searchFolder(subfolder, folderPath);
+                if (found)
+                    return found;
+            }
+            return null;
+        }
+        if (projectInfo.rootFolder?.[0]) {
+            return searchFolder(projectInfo.rootFolder[0], '');
+        }
+        return null;
+    }
+    /**
+     * Download a single file by ID
+     */
+    async downloadFile(projectId, fileId, fileType) {
+        const endpoint = fileType === 'doc' ? 'doc' : 'file';
+        const response = await this.httpRequest(`${this.baseUrl}/project/${projectId}/${endpoint}/${fileId}`, {
+            headers: this.getHeaders(),
+            expect: fileType === 'doc' ? 'json' : 'buffer'
+        });
+        if (!response.ok) {
+            throw new Error(`Failed to download file: ${response.status}`);
+        }
+        this.applySetCookieHeaders(response.headers['set-cookie']);
+        if (fileType === 'doc') {
+            // Docs return JSON with lines array
+            const data = response.body;
+            const content = (data.lines || []).join('\n');
+            return Buffer.from(content, 'utf-8');
+        }
+        else {
+            return response.body;
+        }
+    }
+    /**
+     * Rename a file, doc, or folder
+     */
+    async renameEntity(projectId, entityId, entityType, newName) {
+        const response = await this.httpRequest(`${this.baseUrl}/project/${projectId}/${entityType}/${entityId}/rename`, {
+            method: 'POST',
+            headers: this.getHeaders(true),
+            body: JSON.stringify({ name: newName }),
+            expect: 'text'
+        });
+        if (!response.ok) {
+            throw new Error(`Failed to rename entity: ${response.status}`);
+        }
+        this.applySetCookieHeaders(response.headers['set-cookie']);
+    }
+    /**
+     * Delete a file by path
+     */
+    async deleteByPath(projectId, path) {
+        const entity = await this.findEntityByPath(projectId, path);
+        if (!entity) {
+            throw new Error(`File not found: ${path}`);
+        }
+        await this.deleteEntity(projectId, entity.id, entity.type);
+    }
+    /**
+     * Rename a file by path
+     */
+    async renameByPath(projectId, oldPath, newName) {
+        const entity = await this.findEntityByPath(projectId, oldPath);
+        if (!entity) {
+            throw new Error(`File not found: ${oldPath}`);
+        }
+        await this.renameEntity(projectId, entity.id, entity.type, newName);
+    }
+    /**
+     * Download a file by path (uses zip as fallback if ID not available)
+     */
+    async downloadByPath(projectId, path) {
+        const normalizedPath = path.replace(/^\//, '');
+        // First check if file exists
+        const entities = await this.getEntities(projectId);
+        const entityExists = entities.find(e => e.path.replace(/^\//, '') === normalizedPath ||
+            e.path === `/${normalizedPath}`);
+        if (!entityExists) {
+            throw new Error(`File not found: ${path}`);
+        }
+        // Try to find entity with ID for direct download
+        try {
+            const entity = await this.findEntityByPath(projectId, path);
+            if (entity && entity.type !== 'folder') {
+                return await this.downloadFile(projectId, entity.id, entity.type);
+            }
+        }
+        catch (e) {
+            // Fall through to zip method
+        }
+        // Fallback: download zip and extract the file
+        const zipBuffer = await this.downloadProject(projectId);
+        const AdmZip = (await import('adm-zip')).default;
+        const zip = new AdmZip(zipBuffer);
+        for (const entry of zip.getEntries()) {
+            if (entry.entryName === normalizedPath || entry.entryName === path) {
+                return entry.getData();
+            }
+        }
+        throw new Error(`File not found in archive: ${path}`);
+    }
+    async getCommentThreads(projectId) {
+        const response = await this.httpRequest(`${this.baseUrl}/project/${projectId}/threads`, {
+            headers: this.getHeaders(),
+            expect: 'json'
+        });
+        if (!response.ok) {
+            throw new Error(`Failed to fetch comment threads: ${response.status}`);
+        }
+        this.applySetCookieHeaders(response.headers['set-cookie']);
+        return response.body;
+    }
+    async listComments(projectId, options = {}) {
+        const status = options.status || 'all';
+        const contextLines = options.contextLines || 0;
+        const projectInfo = await this.getProjectInfo(projectId);
+        const docs = this.collectProjectDocs(projectInfo);
+        const threads = await this.getCommentThreads(projectId);
+        const comments = [];
+        const session = await this.openProjectSocket(projectId);
+        try {
+            for (const doc of docs) {
+                const joinedDoc = await this.joinDocument(session, doc.id);
+                if (joinedDoc.type === 'history-ot') {
+                    for (const comment of joinedDoc.ranges.comments || []) {
+                        const ranges = comment.ranges || [];
+                        const firstRange = ranges[0];
+                        if (!firstRange)
+                            continue;
+                        const selectedText = ranges
+                            .map((range) => joinedDoc.content.slice(range.pos, range.pos + range.length))
+                            .join('');
+                        const location = this.positionToLineColumn(joinedDoc.content, firstRange.pos);
+                        const thread = threads[comment.id] || { messages: [] };
+                        const resolved = Boolean(comment.resolved || thread.resolved);
+                        comments.push({
+                            threadId: comment.id,
+                            docId: doc.id,
+                            path: doc.path,
+                            position: firstRange.pos,
+                            line: location.line,
+                            column: location.column,
+                            selectedText,
+                            resolved,
+                            messages: thread.messages || [],
+                            context: this.buildCommentContext(joinedDoc.content, location.line, contextLines)
+                        });
+                    }
+                    continue;
+                }
+                for (const comment of joinedDoc.ranges.comments || []) {
+                    const op = comment.op || {};
+                    const threadId = op.t || comment.id;
+                    if (!threadId || typeof op.p !== 'number')
+                        continue;
+                    const selectedText = typeof op.c === 'string'
+                        ? op.c
+                        : joinedDoc.content.slice(op.p, op.p + (op.c?.length || 0));
+                    const location = this.positionToLineColumn(joinedDoc.content, op.p);
+                    const thread = threads[threadId] || { messages: [] };
+                    const resolved = Boolean(comment.resolved || op.resolved || thread.resolved);
+                    comments.push({
+                        threadId,
+                        docId: doc.id,
+                        path: doc.path,
+                        position: op.p,
+                        line: location.line,
+                        column: location.column,
+                        selectedText,
+                        resolved,
+                        messages: thread.messages || [],
+                        context: this.buildCommentContext(joinedDoc.content, location.line, contextLines)
+                    });
+                }
+            }
+        }
+        finally {
+            await this.closeProjectSocket(session);
+        }
+        return comments
+            .filter(comment => {
+            if (status === 'all')
+                return true;
+            return status === 'resolved' ? comment.resolved : !comment.resolved;
+        })
+            .sort((a, b) => a.path.localeCompare(b.path) || a.position - b.position);
+    }
+    async resolveComment(projectId, threadId) {
+        const comment = await this.findComment(projectId, threadId);
+        const response = await this.httpRequest(`${this.baseUrl}/project/${projectId}/doc/${comment.docId}/thread/${threadId}/resolve`, {
+            method: 'POST',
+            headers: this.getHeaders(true),
+            body: '',
+            expect: 'text'
+        });
+        if (!response.ok) {
+            throw new Error(`Failed to resolve comment: ${response.status}`);
+        }
+        this.applySetCookieHeaders(response.headers['set-cookie']);
+        return comment;
+    }
+    async reopenComment(projectId, threadId) {
+        const comment = await this.findComment(projectId, threadId);
+        const response = await this.httpRequest(`${this.baseUrl}/project/${projectId}/doc/${comment.docId}/thread/${threadId}/reopen`, {
+            method: 'POST',
+            headers: this.getHeaders(true),
+            body: '',
+            expect: 'text'
+        });
+        if (!response.ok) {
+            throw new Error(`Failed to reopen comment: ${response.status}`);
+        }
+        this.applySetCookieHeaders(response.headers['set-cookie']);
+        return comment;
+    }
+    async deleteComment(projectId, threadId) {
+        const comment = await this.findComment(projectId, threadId);
+        const response = await this.httpRequest(`${this.baseUrl}/project/${projectId}/doc/${comment.docId}/thread/${threadId}`, {
+            method: 'DELETE',
+            headers: this.getHeaders(true),
+            body: '',
+            expect: 'text'
+        });
+        if (!response.ok) {
+            throw new Error(`Failed to delete comment: ${response.status}`);
+        }
+        this.applySetCookieHeaders(response.headers['set-cookie']);
+        return comment;
+    }
+    async findComment(projectId, threadId) {
+        const comments = await this.listComments(projectId);
+        const comment = comments.find(item => item.threadId === threadId);
+        if (!comment) {
+            throw new Error(`Comment thread not found: ${threadId}`);
+        }
+        return comment;
+    }
+    resolveCommentSelection(doc, options) {
+        if (options.selectedText) {
+            const occurrence = options.occurrence || 1;
+            let fromIndex = 0;
+            let position = -1;
+            for (let index = 0; index < occurrence; index++) {
+                position = doc.content.indexOf(options.selectedText, fromIndex);
+                if (position === -1)
+                    break;
+                fromIndex = position + options.selectedText.length;
+            }
+            if (position === -1) {
+                throw new Error(`Selected text not found in ${options.filePath}`);
+            }
+            return { position, selectedText: options.selectedText };
+        }
+        let position = options.position;
+        if (position == null) {
+            if (options.line == null || options.column == null) {
+                throw new Error('Add comment requires either --text, --position, or both --line and --column');
+            }
+            const lines = doc.content.split('\n');
+            if (options.line < 1 || options.line > lines.length) {
+                throw new Error(`Line out of range: ${options.line}`);
+            }
+            if (options.column < 1 || options.column > lines[options.line - 1].length + 1) {
+                throw new Error(`Column out of range: ${options.column}`);
+            }
+            position = lines.slice(0, options.line - 1).reduce((sum, line) => sum + line.length + 1, 0) + options.column - 1;
+        }
+        const length = options.length || 1;
+        if (position < 0 || position + length > doc.content.length) {
+            throw new Error('Comment selection is outside the document');
+        }
+        return {
+            position,
+            selectedText: doc.content.slice(position, position + length)
+        };
+    }
+    async addComment(projectId, options) {
+        const projectInfo = await this.getProjectInfo(projectId);
+        const docs = this.collectProjectDocs(projectInfo);
+        const normalizedPath = options.filePath.replace(/^\//, '');
+        const doc = docs.find(item => item.path === normalizedPath || item.path.replace(/^\//, '') === normalizedPath);
+        if (!doc) {
+            throw new Error(`Doc not found: ${options.filePath}`);
+        }
+        const session = await this.openProjectSocket(projectId);
+        try {
+            const joinedDoc = await this.joinDocument(session, doc.id);
+            const selection = this.resolveCommentSelection(joinedDoc, options);
+            const threadId = this.generateCommentThreadId();
+            await this.postCommentMessage(projectId, threadId, options.content);
+            const op = joinedDoc.type === 'history-ot'
+                ? {
+                    commentId: threadId,
+                    ranges: [{ pos: selection.position, length: selection.selectedText.length }]
+                }
+                : {
+                    c: selection.selectedText,
+                    p: selection.position,
+                    t: threadId
+                };
+            await this.socketRpc(session, 'applyOtUpdate', [doc.id, {
+                    doc: doc.id,
+                    op: [op],
+                    v: joinedDoc.version
+                }]);
+            const location = this.positionToLineColumn(joinedDoc.content, selection.position);
+            return {
+                threadId,
+                docId: doc.id,
+                path: doc.path,
+                position: selection.position,
+                line: location.line,
+                column: location.column,
+                selectedText: selection.selectedText,
+                resolved: false,
+                messages: []
+            };
+        }
+        finally {
+            await this.closeProjectSocket(session);
+        }
+    }
+    async postCommentMessage(projectId, threadId, content) {
+        const response = await this.httpRequest(`${this.baseUrl}/project/${projectId}/thread/${threadId}/messages`, {
+            method: 'POST',
+            headers: this.getHeaders(true),
+            body: JSON.stringify({ content }),
+            expect: 'text'
+        });
+        if (!response.ok) {
+            throw new Error(`Failed to post comment message: ${response.status}`);
+        }
+        this.applySetCookieHeaders(response.headers['set-cookie']);
+        if (!response.body)
+            return null;
+        try {
+            return JSON.parse(response.body);
+        }
+        catch {
+            return null;
+        }
+    }
+    /**
+     * Compile project and get all output files
+     */
+    async compileWithOutputs(projectId, resourcePath) {
+        const response = await this.httpRequest(this.compileUrl(projectId), {
+            method: 'POST',
+            headers: this.getHeaders(true),
+            body: this.buildCompileRequestBody(resourcePath),
+            expect: 'json'
+        });
+        if (!response.ok) {
+            throw new Error(`Failed to compile project: ${response.status}`);
+        }
+        this.applySetCookieHeaders(response.headers['set-cookie']);
+        const data = response.body;
+        // Prefer 'output.pdf' (the main compile output) over any other PDF.
+        // See #26 — projects with figure PDFs could return the wrong file.
+        const pdfFile = data.outputFiles?.find((f) => f.path === 'output.pdf')
+            || data.outputFiles?.find((f) => f.type === 'pdf');
+        // Overleaf's CDN requires ?clsiserverid=<id> for build-output downloads.
+        // Without it every output (pdf/log/bbl/...) 404s. See issue #22.
+        const qs = data.clsiServerId ? `?clsiserverid=${encodeURIComponent(data.clsiServerId)}` : '';
+        return {
+            status: data.status,
+            pdfUrl: pdfFile ? `${this.baseUrl}${pdfFile.url}${qs}` : undefined,
+            outputFiles: (data.outputFiles || []).map((f) => ({
+                path: f.path,
+                type: f.type,
+                url: `${this.baseUrl}${f.url}${qs}`
+            })),
+            failureHint: data.status !== 'success' && resourcePath ? RESOURCE_PATH_FAILURE_HINT : undefined
+        };
+    }
+    /**
+     * Download a compile output file (logs, bbl, aux, etc.)
+     */
+    async downloadOutputFile(url, timeoutMs) {
+        return this.downloadBuffer(url, timeoutMs);
+    }
+}
+//# sourceMappingURL=client.js.map

@@ -1,0 +1,88 @@
+{
+  "name": "@aloth/olcli",
+  "version": "0.8.0",
+  "description": "Local backup/distribution of @aloth/olcli 0.8.0 with Fernand's wrapper scripts.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./cli": "./dist/cli.js"
+  },
+  "bin": {
+    "olcli": "dist/cli.js",
+    "olcli-mcp": "dist/mcp.js"
+  },
+  "scripts": {
+    "mcp": "node dist/mcp.js",
+    "test": "node dist/cli.js --version"
+  },
+  "keywords": [
+    "overleaf",
+    "overleaf-cli",
+    "latex",
+    "latex-cli",
+    "cli",
+    "command-line",
+    "sync",
+    "tex",
+    "pdf",
+    "academic",
+    "writing",
+    "latex-editor",
+    "overleaf-sync",
+    "research",
+    "compile",
+    "arxiv",
+    "terminal",
+    "typescript",
+    "latex-tools"
+  ],
+  "author": "Alexander Loth <alex@alexloth.com> (https://alexloth.com)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Qubit-Fernand/olcli-local-backup.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Qubit-Fernand/olcli-local-backup/issues"
+  },
+  "homepage": "https://github.com/Qubit-Fernand/olcli-local-backup#readme",
+  "upstream": {
+    "name": "@aloth/olcli",
+    "repository": "https://github.com/aloth/olcli",
+    "baseVersion": "0.8.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "adm-zip": "^0.6.0",
+    "chalk": "^5.3.0",
+    "cheerio": "^1.0.0",
+    "commander": "^12.1.0",
+    "conf": "^13.0.0",
+    "ignore": "^7.0.5",
+    "ora": "^8.0.1",
+    "tough-cookie": "^4.1.4",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
+    "@types/node": "^22.0.0",
+    "@types/tough-cookie": "^4.0.5",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "dist",
+    "local-bin",
+    "UPSTREAM-README.md",
+    "README.md",
+    "LICENSE"
+  ]
+}
