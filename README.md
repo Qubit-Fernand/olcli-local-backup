@@ -20,6 +20,8 @@ state are tracked.
 
 ## Upstream provenance
 
+Prototype forked from [`aloth/olcli`](https://github.com/aloth/olcli).
+
 Upstream package: [`@aloth/olcli`](https://github.com/aloth/olcli)
 
 Base version: `0.8.0`
@@ -63,4 +65,3 @@ olcli compile --help
 olcli pdf --help
 olcli output --help
 ```
-
